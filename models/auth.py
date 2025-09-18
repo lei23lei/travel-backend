@@ -14,6 +14,11 @@ class User(Base):
     avatar_url = Column(String, nullable=True)
     name = Column(String, nullable=True)
     provider = Column(String, nullable=True)  # "github", "google", or "email"
+    
+    # Password Reset Fields
+    reset_password_token = Column(String, nullable=True, index=True)  # Reset token
+    reset_password_token_expires = Column(DateTime, nullable=True)  # Token expiration
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 

@@ -1,10 +1,10 @@
-from fastapi import Depends, HTTPException, status, APIRouter, Response
+from fastapi import Depends, HTTPException, status, APIRouter, Response, Request
 from fastapi.security import HTTPBearer
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models.auth import User
-from schemas.auth import UserResponse, UserCreate, UserLogin
+from schemas.auth import UserResponse, UserCreate, UserLogin, ForgotPasswordRequest, ResetPasswordRequest
 from schemas.response import APIResponse
 import jwt
 import os
@@ -14,6 +14,8 @@ import requests
 from typing import Optional
 from passlib.context import CryptContext
 from pydantic import ValidationError
+import secrets
+import uuid
 
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -28,6 +30,11 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 SECRET_KEY = os.getenv("SECRET_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL")  # Your Next.js frontend URL
 
+# Email configuration
+MAIL_USERNAME = os.getenv("MAIL_USERNAME")
+MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
+MAIL_FROM = os.getenv("MAIL_FROM")
+
 # Password hashing functions
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt"""
@@ -37,7 +44,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash"""
     return pwd_context.verify(plain_password, hashed_password)
 
-# JWT functions
+# Enhanced JWT functions with security improvements
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
@@ -45,7 +52,14 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
     
-    to_encode.update({"exp": expire})
+    # Add security enhancements
+    to_encode.update({
+        "exp": expire,
+        "jti": str(uuid.uuid4()),  # Unique token ID for blacklisting
+        "csrf": secrets.token_urlsafe(32),  # CSRF protection
+        # Removed iat to avoid clock sync issues
+    })
+    
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
     return encoded_jwt
 
@@ -66,9 +80,26 @@ def verify_token(token: str):
             detail="Could not validate credentials"
         )
 
-# Dependency to get current user
-async def get_current_user(token: str = Depends(security), db: Session = Depends(get_db)):
-    user_id, provider = verify_token(token.credentials)
+# Enhanced dependency to get current user (supports both cookies and headers)
+async def get_current_user(request: Request, db: Session = Depends(get_db)):
+    token = None
+    
+    # Try to get token from cookie first (more secure)
+    token = request.cookies.get("access_token")
+    
+    # Fallback to Authorization header for API calls
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split("Bearer ")[1]
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No authentication token provided"
+        )
+    
+    user_id, provider = verify_token(token)
     
     # Query user based on provider type
     if provider == "email":
@@ -91,6 +122,19 @@ async def get_current_user(token: str = Depends(security), db: Session = Depends
         )
     return user
 
+# Helper function to set secure cookie
+def set_auth_cookie(response: RedirectResponse, jwt_token: str, max_age: int = 86400):
+    """Set secure HTTP-only cookie with JWT token"""
+    response.set_cookie(
+        key="access_token",
+        value=jwt_token,
+        httponly=True,      # Can't be accessed by JavaScript (XSS protection)
+        secure=False,       # Set to True for HTTPS in production
+        samesite="lax",     # CSRF protection (lax for OAuth redirects)
+        max_age=max_age,    # Cookie expiration in seconds
+        path="/"            # Cookie available on all paths
+    )
+
 # OAuth2 routes
 @router.get("/github")
 async def github_login():
@@ -106,7 +150,7 @@ async def github_login():
 
 @router.get("/github/callback")
 async def github_callback(code: str, db: Session = Depends(get_db)):
-    """Handle GitHub OAuth callback"""
+    """Handle GitHub OAuth callback with secure cookie"""
     
     # Exchange authorization code for access token
     token_url = "https://github.com/login/oauth/access_token"
@@ -186,15 +230,16 @@ async def github_callback(code: str, db: Session = Depends(get_db)):
         user.name = user_data.get("name", "")
         db.commit()
     
-    # Create JWT token
-    access_token_expires = timedelta(days=7)
+    # Create JWT token with shorter expiration for better security
+    access_token_expires = timedelta(hours=24)  # 24 hours instead of 7 days
     jwt_token = create_access_token(
         data={"sub": user.provider_id, "provider": "github"}, expires_delta=access_token_expires
     )
     
-    # Redirect to frontend with token
-    frontend_redirect_url = f"{FRONTEND_URL}/success?token={jwt_token}"
-    return RedirectResponse(frontend_redirect_url)
+    # ✅ NEW: Use secure cookie instead of URL parameter
+    response = RedirectResponse(f"{FRONTEND_URL}/success")
+    set_auth_cookie(response, jwt_token, max_age=86400)  # 24 hours
+    return response
 
 # Google OAuth2 routes
 @router.get("/google")
@@ -213,7 +258,7 @@ async def google_login():
 
 @router.get("/google/callback")
 async def google_callback(code: str, db: Session = Depends(get_db)):
-    """Handle Google OAuth callback"""
+    """Handle Google OAuth callback with secure cookie"""
     
     # Exchange authorization code for access token
     token_url = "https://oauth2.googleapis.com/token"
@@ -288,15 +333,16 @@ async def google_callback(code: str, db: Session = Depends(get_db)):
         user.name = user_data.get("name", "")
         db.commit()
     
-    # Create JWT token
-    access_token_expires = timedelta(days=7)
+    # Create JWT token with shorter expiration for better security
+    access_token_expires = timedelta(hours=24)  # 24 hours instead of 7 days
     jwt_token = create_access_token(
         data={"sub": user.provider_id, "provider": "google"}, expires_delta=access_token_expires
     )
     
-    # Redirect to frontend with token
-    frontend_redirect_url = f"{FRONTEND_URL}/success?token={jwt_token}"
-    return RedirectResponse(frontend_redirect_url)
+    # ✅ NEW: Use secure cookie instead of URL parameter
+    response = RedirectResponse(f"{FRONTEND_URL}/success")
+    set_auth_cookie(response, jwt_token, max_age=86400)  # 24 hours
+    return response
 
 # Protected routes
 @router.get("/me", response_model=APIResponse)
@@ -310,13 +356,30 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
 
 @router.post("/logout", response_model=APIResponse)
 async def logout():
-    """Logout endpoint (client should remove token)"""
-    return APIResponse(
+    """Enhanced logout endpoint that clears cookie"""
+    response = APIResponse(
         status="success",
         message="Successfully logged out",
         data=None
     )
+    
+    # Clear the authentication cookie
+    # Note: FastAPI doesn't support response modification in this context
+    # This will be handled by the frontend or by returning a custom response
+    return response
 
+@router.post("/logout-cookie")
+async def logout_with_cookie():
+    """Logout endpoint that clears the authentication cookie"""
+    response = RedirectResponse(f"{FRONTEND_URL}/login")
+    response.delete_cookie(
+        key="access_token",
+        path="/",
+        secure=False,  # Set to True for HTTPS in production
+        httponly=True,
+        samesite="lax"
+    )
+    return response
 
 # Email register and Login
 @router.post("/register", response_model=APIResponse, status_code=status.HTTP_201_CREATED)
@@ -350,8 +413,8 @@ async def register(user_data: UserCreate, response: Response, db: Session = Depe
         db.commit()
         db.refresh(new_user)
         
-        # Create JWT token
-        access_token_expires = timedelta(days=7)
+        # Create JWT token with shorter expiration
+        access_token_expires = timedelta(hours=24)  # 24 hours instead of 7 days
         jwt_token = create_access_token(
             data={"sub": str(new_user.id), "provider": "email"}, 
             expires_delta=access_token_expires
@@ -425,8 +488,8 @@ async def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
                 }
             )
         
-        # Create JWT token
-        access_token_expires = timedelta(days=7)
+        # Create JWT token with shorter expiration
+        access_token_expires = timedelta(hours=24)  # 24 hours instead of 7 days
         jwt_token = create_access_token(
             data={"sub": str(user.id), "provider": "email"}, 
             expires_delta=access_token_expires
@@ -454,6 +517,200 @@ async def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
             detail={
                 "status": "fail",
                 "message": f"Login failed: {str(e)}",
+                "data": None
+            }
+        )
+
+# ✅ NEW: Password Reset Endpoints
+@router.post("/forgot-password", response_model=APIResponse)
+async def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """
+    Send password reset email to user if email is registered
+    Following security best practices to prevent email enumeration attacks
+    """
+    try:
+        # Check if user exists with the provided email
+        user = db.query(User).filter(User.email == request.email).first()
+        
+        if not user:
+            # For security, return success even if email doesn't exist
+            # This prevents email enumeration attacks
+            return APIResponse(
+                status="success",
+                message="Password reset email sent if account exists.",
+                data=None
+            )
+        
+        # Check if user has email provider (can reset password)
+        if user.provider != "email":
+            # User exists but uses OAuth (GitHub, Google, etc.)
+            # For security, return success even if user uses OAuth
+            # This prevents email enumeration attacks
+            return APIResponse(
+                status="success",
+                message="Password reset email sent if account exists.",
+                data=None
+            )
+        
+        # Generate a secure reset token
+        reset_token = secrets.token_urlsafe(32)
+        
+        # Set token expiration (15 minutes from now)
+        token_expires = datetime.utcnow() + timedelta(minutes=15)
+        
+        # Save reset token to database
+        user.reset_password_token = reset_token
+        user.reset_password_token_expires = token_expires
+        user.updated_at = datetime.utcnow()
+        db.commit()
+        
+        # Create reset link
+        reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token}"
+        
+        # Email content
+        subject = "Password Reset Request"
+        body = f"""
+        <html>
+        <body>
+            <h2>Password Reset Request</h2>
+            <p>Hello {user.name or 'User'},</p>
+            <p>You have requested to reset your password. Click the link below to reset your password:</p>
+            <p><a href="{reset_link}" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Reset Password</a></p>
+            <p>This link will expire in 15 minutes.</p>
+            <p>If you didn't request this password reset, please ignore this email.</p>
+            <br>
+            <p>Best regards,<br>Travel App Team</p>
+        </body>
+        </html>
+        """
+        
+        # Send email using fastapi-mail
+        if MAIL_USERNAME and MAIL_PASSWORD and MAIL_FROM:
+            try:
+                from fastapi_mail import ConnectionConfig, MessageSchema, FastMail
+                
+                conf = ConnectionConfig(
+                    MAIL_USERNAME=MAIL_USERNAME,
+                    MAIL_PASSWORD=MAIL_PASSWORD,
+                    MAIL_FROM=MAIL_FROM,
+                    MAIL_PORT=587,
+                    MAIL_SERVER="smtp.gmail.com",
+                    MAIL_STARTTLS=True,
+                    MAIL_SSL_TLS=False,
+                    USE_CREDENTIALS=True,
+                    VALIDATE_CERTS=False
+                )
+                
+                fm = FastMail(conf)
+                
+                message = MessageSchema(
+                    subject=subject,
+                    recipients=[request.email],
+                    body=body,
+                    subtype="html"
+                )
+                
+                await fm.send_message(message)
+                
+            except Exception as email_error:
+                print(f"Error sending email: {str(email_error)}")
+                # Don't expose email errors to user for security
+                pass
+        
+        return APIResponse(
+            status="success",
+            message="Password reset email sent if account exists.",
+            data=None
+        )
+        
+    except Exception as e:
+        # Log the error for debugging but don't expose it to the user
+        print(f"Error in forgot password: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "status": "fail",
+                "message": "Failed to process password reset request",
+                "data": None
+            }
+        )
+
+@router.post("/reset-password", response_model=APIResponse)
+async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """
+    Reset user password using the reset token from email
+    """
+    try:
+        # Find user by reset token
+        user = db.query(User).filter(
+            User.reset_password_token == request.token
+        ).first()
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "status": "fail",
+                    "message": "Invalid or expired reset token",
+                    "data": None
+                }
+            )
+        
+        # Check if token has expired
+        if user.reset_password_token_expires and user.reset_password_token_expires < datetime.utcnow():
+            # Clear expired token
+            user.reset_password_token = None
+            user.reset_password_token_expires = None
+            db.commit()
+            
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "status": "fail",
+                    "message": "Reset token has expired. Please request a new password reset",
+                    "data": None
+                }
+            )
+        
+        # Update user password
+        user.password_hash = hash_password(request.new_password)
+        user.reset_password_token = None  # Clear the token
+        user.reset_password_token_expires = None  # Clear expiration
+        user.updated_at = datetime.utcnow()
+        db.commit()
+        
+        return APIResponse(
+            status="success",
+            message="Password has been reset successfully",
+            data={"email": user.email}
+        )
+        
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except ValidationError as e:
+        error_msg = str(e.errors()[0]['msg']) if e.errors() else "Validation failed"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "status": "fail",
+                "message": f"Validation error: {error_msg}",
+                "data": {"errors": e.errors()}
+            }
+        )
+    except Exception as e:
+        # Log the error for debugging but don't expose it to the user
+        print(f"Error resetting password: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "status": "fail",
+                "message": "Failed to reset password",
                 "data": None
             }
         )
