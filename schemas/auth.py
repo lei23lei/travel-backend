@@ -56,3 +56,17 @@ class ResetPasswordRequest(BaseModel):
         if not re.search(r'\d', v):
             raise ValueError('Password must contain at least one number')
         return v
+
+class UserUpdate(BaseModel):
+    name: str
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if not v or len(v.strip()) == 0:
+            raise ValueError('Name is required and cannot be empty')
+        
+        name = v.strip()
+        if len(name) > 30:
+            raise ValueError('Name must be 30 characters or less')
+        
+        return name

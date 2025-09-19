@@ -4,7 +4,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models.auth import User
-from schemas.auth import UserResponse, UserCreate, UserLogin, ForgotPasswordRequest, ResetPasswordRequest
+from schemas.auth import UserResponse, UserCreate, UserLogin, ForgotPasswordRequest, ResetPasswordRequest, UserUpdate
 from schemas.response import APIResponse
 import jwt
 import os
@@ -236,10 +236,9 @@ async def github_callback(code: str, db: Session = Depends(get_db)):
         data={"sub": user.provider_id, "provider": "github"}, expires_delta=access_token_expires
     )
     
-    # ✅ NEW: Use secure cookie instead of URL parameter
-    response = RedirectResponse(f"{FRONTEND_URL}/success")
-    set_auth_cookie(response, jwt_token, max_age=86400)  # 24 hours
-    return response
+    # ✅ CHANGED: Send token in URL instead of cookie
+    frontend_redirect_url = f"{FRONTEND_URL}/success?token={jwt_token}"
+    return RedirectResponse(frontend_redirect_url)
 
 # Google OAuth2 routes
 @router.get("/google")
@@ -339,10 +338,9 @@ async def google_callback(code: str, db: Session = Depends(get_db)):
         data={"sub": user.provider_id, "provider": "google"}, expires_delta=access_token_expires
     )
     
-    # ✅ NEW: Use secure cookie instead of URL parameter
-    response = RedirectResponse(f"{FRONTEND_URL}/success")
-    set_auth_cookie(response, jwt_token, max_age=86400)  # 24 hours
-    return response
+    # ✅ CHANGED: Send token in URL instead of cookie
+    frontend_redirect_url = f"{FRONTEND_URL}/success?token={jwt_token}"
+    return RedirectResponse(frontend_redirect_url)
 
 # Protected routes
 @router.get("/me", response_model=APIResponse)
@@ -354,32 +352,65 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
         data=UserResponse.from_orm(current_user).dict()
     )
 
+@router.patch("/me", response_model=APIResponse)
+async def update_user_name(
+    user_update: UserUpdate, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update current user's name (max 30 characters)"""
+    try:
+        # Update the name
+        current_user.name = user_update.name
+        
+        # Update the updated_at timestamp
+        current_user.updated_at = datetime.utcnow()
+        
+        # Save changes to database
+        db.commit()
+        db.refresh(current_user)
+        
+        return APIResponse(
+            status="success",
+            message="Name updated successfully",
+            data=UserResponse.from_orm(current_user).dict()
+        )
+        
+    except ValidationError as e:
+        # Handle validation errors (like name too long)
+        error_msg = str(e.errors()[0]['msg']) if e.errors() else "Validation failed"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "status": "fail",
+                "message": f"Validation error: {error_msg}",
+                "data": {"errors": e.errors()}
+            }
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"Name update error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "status": "fail",
+                "message": f"Failed to update name: {str(e)}",
+                "data": None
+            }
+        )
+
 @router.post("/logout", response_model=APIResponse)
 async def logout():
-    """Enhanced logout endpoint that clears cookie"""
-    response = APIResponse(
+    """Simple logout endpoint - token removal handled by frontend"""
+    return APIResponse(
         status="success",
         message="Successfully logged out",
         data=None
     )
-    
-    # Clear the authentication cookie
-    # Note: FastAPI doesn't support response modification in this context
-    # This will be handled by the frontend or by returning a custom response
-    return response
 
-@router.post("/logout-cookie")
-async def logout_with_cookie():
-    """Logout endpoint that clears the authentication cookie"""
-    response = RedirectResponse(f"{FRONTEND_URL}/login")
-    response.delete_cookie(
-        key="access_token",
-        path="/",
-        secure=False,  # Set to True for HTTPS in production
-        httponly=True,
-        samesite="lax"
-    )
-    return response
 
 # Email register and Login
 @router.post("/register", response_model=APIResponse, status_code=status.HTTP_201_CREATED)
