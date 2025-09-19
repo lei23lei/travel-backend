@@ -4,7 +4,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models.auth import User
-from schemas.auth import UserResponse, UserCreate, UserLogin, ForgotPasswordRequest, ResetPasswordRequest, UserUpdate
+from schemas.auth import UserResponse, UserCreate, UserLogin, ForgotPasswordRequest, ResetPasswordRequest, UserUpdate, AvatarUpdate
 from schemas.response import APIResponse
 import jwt
 import os
@@ -398,6 +398,56 @@ async def update_user_name(
             detail={
                 "status": "fail",
                 "message": f"Failed to update name: {str(e)}",
+                "data": None
+            }
+        )
+
+@router.patch("/me/avatar", response_model=APIResponse)
+async def update_user_avatar(
+    avatar_update: AvatarUpdate, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update current user's avatar URL"""
+    try:
+        # Update the avatar URL
+        current_user.avatar_url = avatar_update.avatar_url
+        
+        # Update the updated_at timestamp
+        current_user.updated_at = datetime.utcnow()
+        
+        # Save changes to database
+        db.commit()
+        db.refresh(current_user)
+        
+        return APIResponse(
+            status="success",
+            message="Avatar updated successfully",
+            data=UserResponse.from_orm(current_user).dict()
+        )
+        
+    except ValidationError as e:
+        # Handle validation errors (like invalid URL)
+        error_msg = str(e.errors()[0]['msg']) if e.errors() else "Validation failed"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "status": "fail",
+                "message": f"Validation error: {error_msg}",
+                "data": {"errors": e.errors()}
+            }
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"Avatar update error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "status": "fail",
+                "message": f"Failed to update avatar: {str(e)}",
                 "data": None
             }
         )

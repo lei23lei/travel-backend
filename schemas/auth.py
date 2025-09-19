@@ -70,3 +70,24 @@ class UserUpdate(BaseModel):
             raise ValueError('Name must be 30 characters or less')
         
         return name
+
+class AvatarUpdate(BaseModel):
+    avatar_url: str
+    
+    @validator('avatar_url')
+    def validate_avatar_url(cls, v):
+        if not v or len(v.strip()) == 0:
+            raise ValueError('Avatar URL is required and cannot be empty')
+        
+        url = v.strip()
+        
+        # Basic URL validation
+        if not url.startswith(('http://', 'https://')):
+            raise ValueError('Avatar URL must be a valid HTTP or HTTPS URL')
+        
+        # Check if it's a Cloudinary URL (optional validation)
+        if 'cloudinary.com' not in url and 'res.cloudinary.com' not in url:
+            # Allow other valid URLs but warn
+            pass
+        
+        return url
