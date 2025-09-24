@@ -1,0 +1,89 @@
+Frontend: Login Component
+|
+v
+User clicks "Continue with GitHub" Button
+|
+v
+AuthContext: loginWithGitHub() [set loading=true, clear error]
+|
+v
+Open Popup Window: GET /auth/github [API_URL + /auth/github]
+   |
+   v (Popup loads backend route)
+Backend: @router.get("/github") [github_login()]
+   |
+   v
+Construct & Redirect to GitHub OAuth URL
+   (client_id, redirect_uri=/auth/github/callback, scope=user:email)
+   |
+   v
+GitHub OAuth Page: User authorizes app
+   |
+   v (Success)
+GitHub Redirects: /auth/github/callback?code=AUTH_CODE
+   |
+   v (Popup loads backend route)
+Backend: @router.get("/github/callback") [github_callback(code)]
+   |
+   +--> Exchange code for access_token (POST to GitHub /access_token)
+   |      |
+   |      +--> Error? Redirect /success?error=auth_failed&message=...
+   |
+   v
+   Fetch user info (GET /user) & emails (GET /user/emails) with Bearer token
+   |
+   v
+   Query DB for user by provider_id ("github") & provider
+      |
+      +--> Exists? Update username/email/avatar/name
+      |
+      +--> New? Check email conflict (if exists with other provider, redirect error)
+      |         |
+      |         +--> No conflict: Create User model, commit to DB
+   |
+   v
+   Generate JWT: create_access_token(sub=provider_id, provider="github", expires=24h)
+   |
+   v
+   Redirect: /success?token=JWT (or ?error=... on failure)
+   |
+   v (Popup loads)
+Frontend Popup: OAuthSuccess Component [useSearchParams]
+   |
+   +--> Has token? 
+   |      |
+   |      +--> In popup: postMessage to opener {type: "OAUTH_SUCCESS", token}
+   |      |         |
+   |      |         +--> Close popup
+   |      |
+   |      +--> Not popup: tokenManager.setToken(token), set success, redirect /user (2s delay)
+   |
+   +--> Has error?
+         |
+         +--> In popup: postMessage to opener {type: "OAUTH_ERROR", error=msg}, close
+         |
+         +--> Not popup: set error state, show UI
+|
+v (Parent window receives message via useEffect listener)
+AuthContext: handleMessage(event)
+   |
+   +--> OAUTH_SUCCESS: tokenManager.setToken(token), if !loggingOut: checkAuthStatus()
+   |
+   +--> OAUTH_ERROR: setError(msg), set loading=false
+   |
+   v
+checkAuthStatus() [async, set loading=true]
+   |
+   +--> No token? setUser(null), loading=false
+   |
+   +--> Has token: authAPI.getCurrentUser() [uses token]
+         |
+         +--> Success: setUser(response.data), loading=false
+         |
+         +--> Fail: setUser(null), removeToken, setError("Failed to verify")
+|
+v
+isAuthenticated = !!user triggers useEffect in Login: router.push("/user")
+|
+v
+Protected Route: /user (user dashboard)
